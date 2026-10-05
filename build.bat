@@ -10,7 +10,7 @@ if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 
 echo Gerando executavel...
-pyinstaller --onefile --noconsole --name OrganizadorDePastas organizador_pastas.py
+pyinstaller --onefile --noconsole --name OrganizadorDePastas --hidden-import pystray._win32 organizador_pastas.py
 if errorlevel 1 (
     echo.
     echo ERRO ao gerar o executavel. Veja "Solucao de problemas" no README.

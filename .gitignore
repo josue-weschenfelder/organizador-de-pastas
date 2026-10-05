@@ -16,3 +16,6 @@ dist/
 .vscode/
 .idea/
 Thumbs.db
+
+# Modelo local do Levantamento.txt
+modelo_levantamento.txt

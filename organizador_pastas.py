@@ -5,7 +5,12 @@ Observa uma pasta. Quando uma nova pasta é criada dentro dela, abre uma janela
 pedindo o nome do cliente e o número do atendimento/projeto. Depois move a
 pasta nova para:  <pasta observada>\\<Cliente>\\<Atendimento>
 
-Dentro da pasta do atendimento também é criado o arquivo Levantamento.txt.
+Dentro da pasta do atendimento também é criado o arquivo Levantamento.txt, a
+partir do modelo em modelo_levantamento.txt (que pode ser editado).
+
+O programa fica na bandeja do sistema (ícone perto do relógio), de onde é
+possível pausar, abrir a pasta, editar o modelo, ativar a inicialização com o
+Windows e sair.
 
 Na primeira execução pergunta qual pasta observar e salva em config.json.
 Para trocar a pasta depois, apague o config.json.
@@ -13,6 +18,7 @@ Para trocar a pasta depois, apague o config.json.
 
 import json
 import os
+import queue
 import re
 import sys
 import time
@@ -21,20 +27,80 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:  # sem as dependências o programa roda, só que sem ícone na bandeja
+    pystray = None
+
+try:
+    import winreg  # só existe no Windows
+except ImportError:
+    winreg = None
+
+NOME_APP = "Organizador de Pastas"
 INTERVALO_MS = 2000  # de quanto em quanto tempo verifica a pasta
+FILA_MS = 200  # de quanto em quanto tempo processa os cliques do menu da bandeja
 ARQUIVO_LEVANTAMENTO = "Levantamento.txt"  # criado dentro da pasta do atendimento
 
 BASE_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).parent
 CONFIG_FILE = BASE_DIR / "config.json"
+MODELO_FILE = BASE_DIR / "modelo_levantamento.txt"
 INVALIDOS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
+# Modelo usado na primeira execução. Campos: {cliente} {atendimento} {data} {hora}
+MODELO_PADRAO = (
+    "Cliente: {cliente}\n"
+    "Atendimento: {atendimento}\n"
+    "Data: {data}\n"
+    + "-" * 40
+    + "\n\n"
+)
 
+# Pastas que nunca devem disparar a janela (lixeira, pastas de sistema, ocultas...)
+IGNORAR_NOMES = {"system volume information", "recycler", "msocache"}
+ATRIBUTO_OCULTO_OU_SISTEMA = 0x2 | 0x4  # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+
+# Inicialização com o Windows (registro do usuário atual, não exige administrador)
+CHAVE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+NOME_VALOR_RUN = "OrganizadorDePastas"
+
+# Mantém o handle do mutex vivo enquanto o programa roda (instância única)
+_mutex = None
+
+
+# --------------------------------------------------------------------------- #
+# Utilidades
+# --------------------------------------------------------------------------- #
 def limpar_nome(nome: str) -> str:
     """Remove caracteres proibidos no Windows e espaços/pontos nas pontas."""
     return INVALIDOS.sub("_", nome).strip(" .")
 
 
-def carregar_pasta_observada(root: tk.Tk) -> Path:
+def instancia_unica() -> bool:
+    """Retorna False se já houver outra cópia do programa rodando (Windows)."""
+    global _mutex
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _mutex = kernel32.CreateMutexW(None, False, "Local\\OrganizadorDePastas_instancia_unica")
+    return ctypes.get_last_error() != 183  # 183 = ERROR_ALREADY_EXISTS
+
+
+def abrir_no_explorer(caminho: Path):
+    try:
+        os.startfile(caminho)  # type: ignore[attr-defined]  # só existe no Windows
+    except (AttributeError, OSError) as erro:
+        messagebox.showerror(NOME_APP, f"Não foi possível abrir:\n{caminho}\n\n{erro}")
+
+
+# --------------------------------------------------------------------------- #
+# Configuração e pasta observada
+# --------------------------------------------------------------------------- #
+def carregar_pasta_observada() -> Path:
     if CONFIG_FILE.exists():
         try:
             pasta = Path(json.loads(CONFIG_FILE.read_text(encoding="utf-8"))["pasta_observada"])
@@ -52,13 +118,111 @@ def carregar_pasta_observada(root: tk.Tk) -> Path:
     return Path(escolhida)
 
 
+def deve_ignorar(entrada: os.DirEntry) -> bool:
+    nome = entrada.name
+    if nome.startswith(("$", ".")) or nome.casefold() in IGNORAR_NOMES:
+        return True
+    try:
+        atributos = getattr(entrada.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(atributos & ATRIBUTO_OCULTO_OU_SISTEMA)
+
+
 def listar_pastas(raiz: Path) -> set[str]:
     try:
-        return {e.name for e in os.scandir(raiz) if e.is_dir()}
+        return {e.name for e in os.scandir(raiz) if e.is_dir() and not deve_ignorar(e)}
     except OSError:
         return set()
 
 
+# --------------------------------------------------------------------------- #
+# Modelo do Levantamento.txt
+# --------------------------------------------------------------------------- #
+def garantir_modelo():
+    """Cria o modelo padrão na primeira execução."""
+    if not MODELO_FILE.exists():
+        try:
+            MODELO_FILE.write_text(MODELO_PADRAO, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def ler_modelo() -> str:
+    try:
+        return MODELO_FILE.read_text(encoding="utf-8-sig")
+    except OSError:
+        return MODELO_PADRAO
+
+
+def renderizar_modelo(modelo: str, cliente: str, atendimento: str) -> str:
+    agora = datetime.now()
+    return (
+        modelo.replace("{cliente}", cliente)
+        .replace("{atendimento}", atendimento)
+        .replace("{data}", f"{agora:%d/%m/%Y}")
+        .replace("{hora}", f"{agora:%H:%M}")
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Inicialização com o Windows
+# --------------------------------------------------------------------------- #
+def comando_inicializacao() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    interpretador = pythonw if pythonw.exists() else Path(sys.executable)
+    return f'"{interpretador}" "{Path(__file__).resolve()}"'
+
+
+def valor_autostart():
+    """Comando registrado para iniciar com o Windows, ou None se não estiver ativo."""
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CHAVE_RUN) as chave:
+            return winreg.QueryValueEx(chave, NOME_VALOR_RUN)[0]
+    except OSError:
+        return None
+
+
+def autostart_ativo() -> bool:
+    return valor_autostart() is not None
+
+
+def definir_autostart(ativar: bool):
+    if winreg is None:
+        raise RuntimeError("A inicialização com o Windows só está disponível no Windows.")
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CHAVE_RUN, 0, winreg.KEY_SET_VALUE) as chave:
+        if ativar:
+            winreg.SetValueEx(chave, NOME_VALOR_RUN, 0, winreg.REG_SZ, comando_inicializacao())
+        else:
+            try:
+                winreg.DeleteValue(chave, NOME_VALOR_RUN)
+            except FileNotFoundError:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# Ícone da bandeja
+# --------------------------------------------------------------------------- #
+def criar_imagem_icone(ativo: bool = True):
+    """Desenha um ícone de pasta (amarelo = observando, cinza = pausado)."""
+    frente, fundo = ((245, 190, 50, 255), (200, 140, 20, 255)) if ativo else (
+        (160, 160, 160, 255),
+        (115, 115, 115, 255),
+    )
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((4, 10, 28, 26), radius=4, fill=fundo)  # aba
+    d.rounded_rectangle((4, 18, 60, 54), radius=6, fill=frente)  # corpo
+    return img
+
+
+# --------------------------------------------------------------------------- #
+# Janela de entrada
+# --------------------------------------------------------------------------- #
 class DialogoCliente:
     """Janela que pede cliente e atendimento. Retorna (cliente, atendimento) ou None."""
 
@@ -121,20 +285,122 @@ class DialogoCliente:
         return self.resultado
 
 
+# --------------------------------------------------------------------------- #
+# Aplicação
+# --------------------------------------------------------------------------- #
 class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.pasta = carregar_pasta_observada(self.root)
-        self.conhecidas = listar_pastas(self.pasta)  # pastas que já existiam não disparam nada
-        self.root.after(INTERVALO_MS, self.verificar)
 
+        if not instancia_unica():
+            messagebox.showinfo(
+                NOME_APP,
+                "O programa já está em execução.\nProcure o ícone na bandeja do sistema (perto do relógio).",
+            )
+            sys.exit(0)
+
+        self.pasta = carregar_pasta_observada()
+        garantir_modelo()
+        self.conhecidas = listar_pastas(self.pasta)  # pastas que já existiam não disparam nada
+        self.pausado = False
+        self.ocupado = False  # True enquanto a janela de cliente está aberta
+        self.fila: "queue.Queue[str]" = queue.Queue()  # cliques do menu (vêm de outra thread)
+        self.icone = None
+
+        self.sincronizar_autostart()
+        self.iniciar_bandeja()
+
+        self.root.after(INTERVALO_MS, self.verificar)
+        self.root.after(FILA_MS, self.processar_fila)
+
+    # ---- bandeja ---------------------------------------------------------- #
+    def titulo_bandeja(self) -> str:
+        estado = "pausado" if self.pausado else "observando"
+        return f"{NOME_APP} - {estado}"
+
+    def pedir(self, acao: str):
+        """Cria o callback do menu. O clique roda em outra thread, então só enfileira."""
+        return lambda _icone=None, _item=None: self.fila.put(acao)
+
+    def iniciar_bandeja(self):
+        if pystray is None:
+            messagebox.showwarning(
+                NOME_APP,
+                "Os pacotes pystray e Pillow não foram encontrados.\n"
+                "O programa vai rodar sem o ícone na bandeja.\n\n"
+                "Para instalar:  pip install -r requirements.txt",
+            )
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem(lambda _i: f"Observando: {self.pasta}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Pausar monitoramento", self.pedir("pausa"), checked=lambda _i: self.pausado),
+            pystray.MenuItem("Abrir pasta observada", self.pedir("abrir_pasta"), default=True),
+            pystray.MenuItem("Editar modelo do Levantamento.txt", self.pedir("abrir_modelo")),
+            pystray.MenuItem("Iniciar com o Windows", self.pedir("autostart"), checked=lambda _i: autostart_ativo()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Sair", self.pedir("sair")),
+        )
+        self.icone = pystray.Icon("organizador_pastas", criar_imagem_icone(True), self.titulo_bandeja(), menu)
+        self.icone.run_detached()
+
+    def processar_fila(self):
+        if not self.ocupado:  # não mexe em nada enquanto a janela de cliente está aberta
+            while True:
+                try:
+                    acao = self.fila.get_nowait()
+                except queue.Empty:
+                    break
+                self.executar(acao)
+        self.root.after(FILA_MS, self.processar_fila)
+
+    def executar(self, acao: str):
+        if acao == "pausa":
+            self.pausado = not self.pausado
+            if not self.pausado:
+                # o que foi criado durante a pausa não dispara a janela
+                self.conhecidas = listar_pastas(self.pasta)
+            if self.icone is not None:
+                self.icone.icon = criar_imagem_icone(not self.pausado)
+                self.icone.title = self.titulo_bandeja()
+        elif acao == "abrir_pasta":
+            abrir_no_explorer(self.pasta)
+        elif acao == "abrir_modelo":
+            garantir_modelo()
+            abrir_no_explorer(MODELO_FILE)
+        elif acao == "autostart":
+            try:
+                definir_autostart(not autostart_ativo())
+            except Exception as erro:
+                messagebox.showerror(NOME_APP, f"Não foi possível alterar a inicialização:\n{erro}")
+        elif acao == "sair":
+            if self.icone is not None:
+                self.icone.stop()
+            self.root.quit()
+
+    def sincronizar_autostart(self):
+        """Se a inicialização está ativa mas o programa mudou de lugar, atualiza o caminho."""
+        try:
+            valor = valor_autostart()
+            if valor is not None and valor != comando_inicializacao():
+                definir_autostart(True)
+        except Exception:
+            pass
+
+    # ---- monitoramento ---------------------------------------------------- #
     def verificar(self):
-        atuais = listar_pastas(self.pasta)
-        for nome in sorted(atuais - self.conhecidas):
-            self.tratar_nova_pasta(nome)
-        # atualiza depois do tratamento para incluir a pasta do cliente recém-criada
-        self.conhecidas = listar_pastas(self.pasta)
+        if not self.pausado:
+            novas = sorted(listar_pastas(self.pasta) - self.conhecidas)
+            if novas:
+                self.ocupado = True
+                try:
+                    for nome in novas:
+                        self.tratar_nova_pasta(nome)
+                finally:
+                    self.ocupado = False
+            # atualiza depois do tratamento para incluir a pasta do cliente recém-criada
+            self.conhecidas = listar_pastas(self.pasta)
         self.root.after(INTERVALO_MS, self.verificar)
 
     def tratar_nova_pasta(self, nome):
@@ -160,20 +426,15 @@ class App:
 
     @staticmethod
     def criar_levantamento(destino: Path, cliente: str, atendimento: str):
-        """Cria o Levantamento.txt com um cabeçalho simples (não sobrescreve se já existir)."""
+        """Cria o Levantamento.txt a partir do modelo (não sobrescreve se já existir)."""
         arquivo = destino / ARQUIVO_LEVANTAMENTO
         if arquivo.exists():
             return
-        cabecalho = (
-            f"Cliente: {cliente}\n"
-            f"Atendimento: {atendimento}\n"
-            f"Data: {datetime.now():%d/%m/%Y}\n"
-            f"{'-' * 40}\n\n"
-        )
+        conteudo = renderizar_modelo(ler_modelo(), cliente, atendimento)
         # utf-8-sig para o Bloco de Notas exibir acentos corretamente
-        arquivo.write_text(cabecalho, encoding="utf-8-sig")
+        arquivo.write_text(conteudo, encoding="utf-8-sig")
 
-    def mover(self, nome, cliente, atendimento):
+    def mover(self, nome, cliente, atendimento) -> Path:
         origem = self.pasta / nome
         pasta_cliente = self.pasta / cliente
         destino = pasta_cliente / atendimento
@@ -213,6 +474,8 @@ class App:
 
     def rodar(self):
         self.root.mainloop()
+        if self.icone is not None:
+            self.icone.stop()
 
 
 if __name__ == "__main__":

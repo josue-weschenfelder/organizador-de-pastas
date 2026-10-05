@@ -25,7 +25,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Gerar o executável
-        run: pyinstaller --onefile --noconsole --name OrganizadorDePastas organizador_pastas.py
+        run: pyinstaller --onefile --noconsole --name OrganizadorDePastas --hidden-import pystray._win32 organizador_pastas.py
 
       - name: Gerar checksum SHA-256
         shell: pwsh
