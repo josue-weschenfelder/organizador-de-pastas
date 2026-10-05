@@ -1,0 +1,42 @@
+name: Release
+
+# Roda quando uma tag de versão (ex.: v1.0.0) é enviada ao GitHub.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements-dev.txt
+
+      - name: Gerar o executável
+        run: pyinstaller --onefile --noconsole --name OrganizadorDePastas organizador_pastas.py
+
+      - name: Gerar checksum SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\OrganizadorDePastas.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  OrganizadorDePastas.exe" | Out-File -Encoding ascii dist\OrganizadorDePastas.exe.sha256
+
+      - name: Publicar a release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/OrganizadorDePastas.exe
+            dist/OrganizadorDePastas.exe.sha256
+          generate_release_notes: true

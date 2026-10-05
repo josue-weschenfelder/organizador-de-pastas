@@ -68,6 +68,17 @@ pyinstaller --onefile --noconsole --name OrganizadorDePastas organizador_pastas.
 
 O executável será criado em `dist\OrganizadorDePastas.exe`. O `config.json` é salvo ao lado dele.
 
+### Releases automáticas
+
+O repositório tem um workflow do GitHub Actions (`.github/workflows/release.yml`) que compila o `.exe` e o anexa a uma release sempre que uma tag de versão é enviada:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Em poucos minutos a release aparece na aba **Releases** com o `OrganizadorDePastas.exe` e um arquivo `.sha256` para conferir a integridade do download.
+
 ### Solução de problemas
 
 **`PermissionError: [WinError 5] Acesso negado` ao gerar o .exe**
